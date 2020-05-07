@@ -72,6 +72,8 @@ $NOMOD51
 ;				Arm check: more correct packet needed, bouble check zero throttol
 ; - Rev16.74	Remove PCA int, update new PWM value into PCA reload registers instantly
 ;				For FETON_DELAY=0, also update damp PCA channel
+; - Rev16.75	Fix dead time bug. Damping will be off when high throttle/dead time is not enough 
+;				
 ;**** **** **** **** **** **** **** **** **** **** **** **** **** **** **** 
 ;
 ; Minimum 8K Bytes of In-System Self-Programmable Flash
@@ -118,7 +120,7 @@ $NOMOD51
 ; List of enumerated supported ESCs
 A_			EQU 1	; X  X  RC X  MC MB MA CC    X  X  Cc Cp Bc Bp Ac Ap
 B_			EQU 2	; X  X  RC X  MC MB MA CC    X  X  Ap Ac Bp Bc Cp Cc
-C_			EQU 3	; Ac Ap MC MB MA CC X  RC    X  X  X  X  Cc Cp Bc Bp
+C_			EQU 3	;;Ac Ap MC MB MA CC X  RC    X  X  X  X  Cc Cp Bc Bp
 D_			EQU 4	; X  X  RC X  CC MA MC MB    X  X  Cc Cp Bc Bp Ac Ap	Com fets inverted
 E_			EQU 5	; L1 L0 RC X  MC MB MA CC    X  L2 Cc Cp Bc Bp Ac Ap	A with LEDs
 F_			EQU 6	; X  X  RC X  MA MB MC CC    X  X  Cc Cp Bc Bp Ac Ap
@@ -128,17 +130,17 @@ I_			EQU 9	; X  X  RC X  MC MB MA CC    X  X  Ac Bc Cc Ap Bp Cp
 J_			EQU 10	; L2 L1 L0 RC CC MB MC MA    X  X  Cc Bc Ac Cp Bp Ap	LEDs
 K_			EQU 11	; X  X  MC X  MB CC MA RC    X  X  Ap Bp Cp Cc Bc Ac	Com fets inverted
 L_			EQU 12	; X  X  RC X  CC MA MB MC    X  X  Ac Bc Cc Ap Bp Cp
-M_			EQU 13	; MA MC CC MB RC L0 X  X     X  Cc Bc Ac Cp Bp Ap X    LED
+M_			EQU 13	; MA MC CC MB RC L0 X  X     X  Cc Bc Ac Cp Bp Ap X		LED
 N_			EQU 14	; X  X  RC X  MC MB MA CC    X  X  Cp Cc Bp Bc Ap Ac
 O_			EQU 15	; X  X  RC X  CC MA MC MB    X  X  Cc Cp Bc Bp Ac Ap	Like D, but low side pwm
 P_			EQU 16	; X  X  RC MA CC MB MC X     X  Cc Bc Ac Cp Bp Ap X
-Q_			EQU 17	; Cp Bp Ap L1 L0 X  RC X     X  MA MB MC CC Cc Bc Ac   LEDs
+Q_			EQU 17	;;Cp Bp Ap L1 L0 X  RC X     X  MA MB MC CC Cc Bc Ac	LEDs
 R_			EQU 18	; X  X  RC X  MC MB MA CC    X  X  Ac Bc Cc Ap Bp Cp
-S_          	EQU 19  	; X  X  RC X  CC MA MC MB    X  X  Cc Cp Bc Bp Ac Ap   Like O, but com fets inverted
+S_          EQU 19  ; X  X  RC X  CC MA MC MB    X  X  Cc Cp Bc Bp Ac Ap	Like O, but com fets inverted
 T_			EQU 20	; RC X  MA X  MB CC MC X     X  X  Cp Bp Ap Ac Bc Cc
-U_			EQU 21	; MA MC CC MB RC L0 L1 L2    X  Cc Bc Ac Cp Bp Ap X	Like M, but with 3 LEDs
+U_			EQU 21	; MA MC CC MB RC L0 L1 L2    X  Cc Bc Ac Cp Bp Ap X		Like M, but with 3 LEDs
 V_			EQU 22	; Cc X  RC X  MC CC MB MA    X  Ap Ac Bp X  X  Bc Cp
-W_                      EQU 23  ; RC MC MB X  CC MA X X      X  Ap Bp Cp X  X  X  X     Tristate gate driver
+W_			EQU 23  ; RC MC MB X  CC MA X X      X  Ap Bp Cp X  X  X  X     Tristate gate driver
 
 
 ;**** **** **** **** ****
@@ -316,7 +318,7 @@ Flags0:						DS	1    		; State flags. Reset upon init_start
 T3_PENDING					EQU 	0		; Timer 3 pending flag
 DEMAG_DETECTED				EQU 	1		; Set when excessive demag time is detected
 COMP_TIMED_OUT				EQU 	2		; Set when comparator reading timed out
-;							EQU 	3
+PWM_DAMPING_OFF				BIT 	Flags0.3
 ;							EQU 	4
 ;							EQU 	5	
 ;							EQU 	6	
@@ -514,7 +516,7 @@ ISEG AT 0D0h
 ;**** **** **** **** ****
 CSEG AT 1A00h            ; "Eeprom" segment
 EEPROM_FW_MAIN_REVISION		EQU	16		; Main revision of the firmware
-EEPROM_FW_SUB_REVISION		EQU	74		; Sub revision of the firmware
+EEPROM_FW_SUB_REVISION		EQU	75		; Sub revision of the firmware
 EEPROM_LAYOUT_REVISION		EQU	33		; Revision of the EEPROM layout
 
 Eep_FW_Main_Revision:		DB	EEPROM_FW_MAIN_REVISION			; EEPROM firmware main revision number
@@ -1563,13 +1565,16 @@ t1_int_pulse_ready:
 		subb	A, #FETON_DELAY
 	ELSE
 		subb	A, #(FETON_DELAY SHL 1)
-	ENDIF
+	ENDIF	
 	mov	Temp3, A
 	mov	A, Temp2
 	subb	A, #0	
 	mov	Temp4, A
+	
+	mov		PWM_DAMPING_OFF,c				;; disable damping when high throttle, cause not enough non-overlap time
 	jnc	t1_int_set_pwm_damp_set
 
+	
 	MOVw	Temp3, Temp4, #0, #0
 	t1_int_set_pwm_damp_set:
 
@@ -2838,28 +2843,53 @@ wait_for_comm_wait:
 ; Performs commutation switching 
 ;
 ;**** **** **** **** **** **** **** **** **** **** **** **** ****
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Set_Pwm_A_  MACRO
+LOCAL  L0
+	Set_Pwm_A_Nodamp
+	jb		PWM_DAMPING_OFF, L0
+	Set_Pwm_A
+L0:
+ENDM
+Set_Pwm_B_  MACRO
+LOCAL  L0
+	Set_Pwm_B_Nodamp
+	jb		PWM_DAMPING_OFF, L0
+	Set_Pwm_B
+L0:
+ENDM
+Set_Pwm_C_  MACRO
+LOCAL  L0
+	Set_Pwm_C_Nodamp
+	jb		PWM_DAMPING_OFF, L0
+	Set_Pwm_C
+L0:
+ENDM
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ; Comm phase 1 to comm phase 2
 comm1comm2:	
 	Set_RPM_Out
 	jb	Flags3.PGM_DIR_REV, comm12_rev
 
 	clr 	IE_EA				; Disable all interrupts
-	BcomFET_off 				; Turn off comfet
-	AcomFET_on				; Turn on comfet
-	Set_Pwm_C					; To reapply power after a demag cut
+		BcomFET_off 				; Turn off comfet
+		CcomFET_off 				; Turn off comfet
+		Set_Pwm_C_					; To reapply power after a demag cut
+		AcomFET_on					; Turn on comfet
 	setb	IE_EA
 	Set_Comp_Phase_B 			; Set comparator phase
-	jmp	comm_exit
-
-comm12_rev:	
+  ret
+  comm12_rev:	
 	clr 	IE_EA				; Disable all interrupts
-	BcomFET_off 				; Turn off comfet
-	CcomFET_on				; Turn on comfet (reverse)
-	Set_Pwm_A					; To reapply power after a demag cut
+		AcomFET_off 				; Turn off comfet
+		BcomFET_off 				; Turn off comfet
+		Set_Pwm_A_					; To reapply power after a demag cut
+		CcomFET_on					; Turn on comfet (reverse)
 	setb	IE_EA
 	Set_Comp_Phase_B 			; Set comparator phase
-	jmp	comm_exit
-
+ret
 
 ; Comm phase 2 to comm phase 3
 comm2comm3:	
@@ -2867,22 +2897,22 @@ comm2comm3:
 	jb	Flags3.PGM_DIR_REV, comm23_rev
 
 	clr 	IE_EA				; Disable all interrupts
-	CpwmFET_off				; Turn off pwmfet
-	Set_Pwm_B					; To reapply power after a demag cut
-	AcomFET_on
+		BcomFET_off					; Turn off pwmfet
+		CcomFET_off					; Turn off pwmfet
+		Set_Pwm_B_					; To reapply power after a demag cut
+		AcomFET_on
 	setb	IE_EA
 	Set_Comp_Phase_C 			; Set comparator phase
-	jmp	comm_exit
-
-comm23_rev:
+  ret
+  comm23_rev:
 	clr 	IE_EA				; Disable all interrupts
-	ApwmFET_off				; Turn off pwmfet (reverse)
-	Set_Pwm_B					; To reapply power after a demag cut
-	CcomFET_on
+		AcomFET_off					; Turn off pwmfet
+		BcomFET_off					; Turn off pwmfet
+		Set_Pwm_B_					; To reapply power after a demag cut
+		CcomFET_on
 	setb	IE_EA
 	Set_Comp_Phase_A 			; Set comparator phase (reverse)
-	jmp	comm_exit
-
+ret
 
 ; Comm phase 3 to comm phase 4
 comm3comm4:	
@@ -2890,22 +2920,22 @@ comm3comm4:
 	jb	Flags3.PGM_DIR_REV, comm34_rev
 
 	clr 	IE_EA				; Disable all interrupts
-	AcomFET_off 				; Turn off comfet
-	CcomFET_on				; Turn on comfet
-	Set_Pwm_B					; To reapply power after a demag cut
+		AcomFET_off 				; Turn off comfet
+		BcomFET_off 				; Turn off comfet
+		Set_Pwm_B_					; To reapply power after a demag cut
+		CcomFET_on					; Turn on comfet
 	setb	IE_EA
 	Set_Comp_Phase_A 			; Set comparator phase
-	jmp	comm_exit
-
-comm34_rev:	
+  ret
+  comm34_rev:	
 	clr 	IE_EA				; Disable all interrupts
-	CcomFET_off 				; Turn off comfet (reverse)
-	AcomFET_on				; Turn on comfet (reverse)
-	Set_Pwm_B					; To reapply power after a demag cut
+		BcomFET_off 				; Turn off comfet (reverse)
+		CcomFET_off 				; Turn off comfet (reverse)
+		Set_Pwm_B_					; To reapply power after a demag cut
+		AcomFET_on					; Turn on comfet (reverse)
 	setb	IE_EA
 	Set_Comp_Phase_C 			; Set comparator phase (reverse)
-	jmp	comm_exit
-
+ret
 
 ; Comm phase 4 to comm phase 5
 comm4comm5:	
@@ -2913,22 +2943,22 @@ comm4comm5:
 	jb	Flags3.PGM_DIR_REV, comm45_rev
 
 	clr 	IE_EA				; Disable all interrupts
-	BpwmFET_off				; Turn off pwmfet
-	Set_Pwm_A					; To reapply power after a demag cut
-	CcomFET_on
+		AcomFET_off
+		BcomFET_off
+		Set_Pwm_A_					; To reapply power after a demag cut
+		CcomFET_on
 	setb	IE_EA
 	Set_Comp_Phase_B 			; Set comparator phase
-	jmp	comm_exit
-
-comm45_rev:
+  ret
+  comm45_rev:
 	clr 	IE_EA				; Disable all interrupts
-	BpwmFET_off				; Turn off pwmfet
-	Set_Pwm_C
-	AcomFET_on				; To reapply power after a demag cut
+		BcomFET_off					; Turn off pwmfet
+		CcomFET_off					; Turn off pwmfet
+		Set_Pwm_C_
+		AcomFET_on					; To reapply power after a demag cut
 	setb	IE_EA
 	Set_Comp_Phase_B 			; Set comparator phase
-	jmp	comm_exit
-
+ret
 
 ; Comm phase 5 to comm phase 6
 comm5comm6:	
@@ -2936,22 +2966,22 @@ comm5comm6:
 	jb	Flags3.PGM_DIR_REV, comm56_rev
 
 	clr 	IE_EA				; Disable all interrupts
-	CcomFET_off 				; Turn off comfet
-	BcomFET_on				; Turn on comfet
-	Set_Pwm_A					; To reapply power after a demag cut
+		AcomFET_off 				; Turn off comfet
+		CcomFET_off 				; Turn off comfet
+		Set_Pwm_A_					; To reapply power after a demag cut
+		BcomFET_on					; Turn on comfet
 	setb	IE_EA
 	Set_Comp_Phase_C 			; Set comparator phase
-	jmp	comm_exit
-
-comm56_rev:
+  ret
+  comm56_rev:
 	clr 	IE_EA				; Disable all interrupts
-	AcomFET_off 				; Turn off comfet (reverse)
-	BcomFET_on				; Turn on comfet
-	Set_Pwm_C					; To reapply power after a demag cut
+		AcomFET_off 				; Turn off comfet (reverse)
+		CcomFET_off 				; Turn off comfet (reverse)
+		Set_Pwm_C_					; To reapply power after a demag cut
+		BcomFET_on					; Turn on comfet
 	setb	IE_EA
 	Set_Comp_Phase_A 			; Set comparator phase (reverse)
-	jmp	comm_exit
-
+ret
 
 ; Comm phase 6 to comm phase 1
 comm6comm1:	
@@ -2959,24 +2989,23 @@ comm6comm1:
 	jb	Flags3.PGM_DIR_REV, comm61_rev
 
 	clr 	IE_EA				; Disable all interrupts
-	ApwmFET_off				; Turn off pwmfet
-	Set_Pwm_C
-	BcomFET_on				; To reapply power after a demag cut
+		AcomFET_off					; Turn off pwmfet
+		CcomFET_off					; Turn off pwmfet
+		Set_Pwm_C_
+		BcomFET_on					; To reapply power after a demag cut
 	setb	IE_EA
 	Set_Comp_Phase_A 			; Set comparator phase
-	jmp	comm_exit
-
-comm61_rev:
+  ret
+  comm61_rev:
 	clr 	IE_EA				; Disable all interrupts
-	CpwmFET_off				; Turn off pwmfet (reverse)
-	Set_Pwm_A
-	BcomFET_on				; To reapply power after a demag cut
+		AcomFET_off					; Turn off pwmfet (reverse)
+		CcomFET_off					; Turn off pwmfet (reverse)
+		Set_Pwm_A_
+		BcomFET_on					; To reapply power after a demag cut
 	setb	IE_EA
 	Set_Comp_Phase_C 			; Set comparator phase (reverse)
-
-comm_exit:
-	ret
-
+ret
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;**** **** **** **** **** **** **** **** **** **** **** **** ****
 ;
@@ -3736,6 +3765,7 @@ bootloader_done:
 	Set_Pwm_Polarity		; Set pwm polarity
 	Enable_Power_Pwm_Module	; Enable power pwm module
 	Enable_Damp_Pwm_Module	; Enable damping pwm module
+	clr		PWM_DAMPING_OFF	;; if set, disable damping
 	; Enable interrupts
 IF MCU_48MHZ == 0
 	mov	IE, #21h			; Enable timer 2 interrupts and INT0 interrupts
