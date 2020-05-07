@@ -72,8 +72,8 @@ $NOMOD51
 ;				Arm check: more correct packet needed, bouble check zero throttol
 ; - Rev16.74	Remove PCA int, update new PWM value into PCA reload registers instantly
 ;				For FETON_DELAY=0, also update damp PCA channel
-; - Rev16.75	Fix dead time bug. Damping will be off when high throttle/dead time is not enough 
-;				
+; - Rev16.75	Rearrange commutatioin logic	 
+; - Rev16.76	Add PWM 48k mode			
 ;**** **** **** **** **** **** **** **** **** **** **** **** **** **** **** 
 ;
 ; Minimum 8K Bytes of In-System Self-Programmable Flash
@@ -272,6 +272,13 @@ IF ESCNO == W_
 $include (W.inc)        ; Select pinout W
 ENDIF
 
+IF PWM == 24
+	PWM_BITS				EQU	10		;; 24khz
+	PWM_DELTA_SIGMA_BITS	EQU	1 
+ELSE
+	PWM_BITS				EQU	9		;; 48khz
+	PWM_DELTA_SIGMA_BITS	EQU	2 
+ENDIF
 
 ;**** **** **** **** ****
 ; Programming defaults
@@ -516,7 +523,7 @@ ISEG AT 0D0h
 ;**** **** **** **** ****
 CSEG AT 1A00h            ; "Eeprom" segment
 EEPROM_FW_MAIN_REVISION		EQU	16		; Main revision of the firmware
-EEPROM_FW_SUB_REVISION		EQU	75		; Sub revision of the firmware
+EEPROM_FW_SUB_REVISION		EQU	76		; Sub revision of the firmware
 EEPROM_LAYOUT_REVISION		EQU	33		; Revision of the EEPROM layout
 
 Eep_FW_Main_Revision:		DB	EEPROM_FW_MAIN_REVISION			; EEPROM firmware main revision number
@@ -646,6 +653,24 @@ LOCAL L0
 	jb		bit, L0
 	jmp		lab
 L0:
+ENDM
+
+IF_ZE_JUMP MACRO byte, lab
+LOCAL L0
+	mov		A, byte
+	jnz		L0
+	jmp		lab
+L0:
+ENDM
+
+IF_ZE  MACRO byte, lab
+	mov		A, byte
+	jz		lab
+ENDM
+
+IF_NZ  MACRO byte, lab
+	mov		A, byte
+	jnz		lab
 ENDM
 
 IF_NZ_JUMP MACRO byte, lab
@@ -1509,81 +1534,73 @@ t1_int_zero_rcp_checked:
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;	
 t1_int_pulse_ready:
-	mov	New_Rcp, Temp1						; Store new pulse length
 	setb	Flags2.RCP_UPDATED		 		; Set updated flag
-	; Check if zero
-	mov	A, Temp1							; Load new pulse value
-	jz	($+5)								; Check if pulse is zero
-
-	mov	Rcp_Stop_Cnt, #0					; Reset rcp stop counter
-
-	; Set pwm limit
-	clr	C
-	mov	A, Pwm_Limit						; Limit to the smallest
-	mov	Temp5, A							; Store limit in Temp5
-	subb	A, Pwm_Limit_By_Rpm
-	jc	($+4)
-
-	mov	Temp5, Pwm_Limit_By_Rpm			
-
-	; Check against limit
-	clr	C
-	mov	A, Temp5
-	subb	A, New_Rcp
-	jnc	t1_int_set_pwm_registers
-
-	mov	A, Temp5							; Multiply limit by 4 (8 for 48MHz MCUs)
+	mov		New_Rcp, Temp1					; Store new pulse length
 	
-	IF MCU_48MHZ == 0
-		mov	B, #4
-	ELSE
-		mov	B, #8
+	IF_ZE	New_Rcp, t1_int_check_new_pulse_value 
+		mov	Rcp_Stop_Cnt, #0				; Rcp !=0 : Reset rcp stop counter
+	t1_int_check_new_pulse_value:
+	
+	;; Set pwm limit
+	mov	Temp5, Pwm_Limit						; Limit to the smallest
+	IF_LT  Pwm_Limit, Pwm_Limit_By_Rpm, t1_int_check_limit 
+		mov	Temp5, Pwm_Limit_By_Rpm				; Store limit in Temp5
+	t1_int_check_limit:
+	
+	;; Check limit > New_Rcp, set pwm registers directly
+	IF_GE  Temp5, New_Rcp, t1_int_set_pwm_registers
+
+	;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+	;; New_Rcp too high, limit to preset value
+	;; Multiply limit: x8
+	mov		A, Temp5							
+	mov		B, #8
+	mul		AB
+	mov		Temp3, A
+	mov		Temp4, B
+	;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+   t1_int_set_pwm_registers:
+	IF PWM_BITS == 9			;; shift to 10bit throttle/pwm duty, will shift 1bit in setting pwm registers macro
+		mov		A, Temp4		;; invert then store to temp1/2
+		rrc		A
+		cpl		A
+		anl		A, #03h
+		mov		Temp2, A
+		mov		A, Temp3
+		rrc		A
+		cpl		A
+		mov		Temp1, A
+	ELSE	
+		mov		A, Temp4		;; invert all 11bit then store to temp1/2
+		cpl		A
+		anl		A, #07h
+		mov		Temp2, A
+		mov		A, Temp3
+		cpl		A
+		mov		Temp1, A	
 	ENDIF
-	
-	mul	AB
-	mov	Temp3, A
-	mov	Temp4, B
 
-	t1_int_set_pwm_registers:
-	mov	A, Temp3
-	cpl	A
-	mov	Temp1, A
-	mov	A, Temp4
-	cpl	A
-	
-	IF MCU_48MHZ == 0
-		anl	A, #3
-	ELSE
-		anl	A, #7
-	ENDIF
-	
-	mov	Temp2, A
-
-	clr	C
-	mov	A, Temp1							; Skew damping fet timing
-	IF MCU_48MHZ == 0
-		subb	A, #FETON_DELAY
-	ELSE
-		subb	A, #(FETON_DELAY SHL 1)
-	ENDIF	
-	mov	Temp3, A
-	mov	A, Temp2
+	clr		C
+	mov		A, Temp1
+	subb	A, #(FETON_DELAY SHL 1)		;; Skew damping fet timing
+	mov		Temp3, A
+	mov		A, Temp2
 	subb	A, #0	
-	mov	Temp4, A
+	mov		Temp4, A
 	
-	mov		PWM_DAMPING_OFF,c				;; disable damping when high throttle, cause not enough non-overlap time
-	jnc	t1_int_set_pwm_damp_set
-
-	
-	MOVw	Temp3, Temp4, #0, #0
+	;;mov		PWM_DAMPING_OFF,c				;; disable damping when high throttle, cause not enough non-overlap time
+	jnc		t1_int_set_pwm_damp_set
+		MOVw	Temp3, Temp4, #0, #0
 	t1_int_set_pwm_damp_set:
 
 	MOVw	Power_Pwm_Reg_L,Power_Pwm_Reg_H,	Temp1,Temp2
 	MOVw	Damp_Pwm_Reg_L,Damp_Pwm_Reg_H,		Temp3,Temp4
 
-	mov	Rcp_Timeout_Cntd, #10				; Set timeout count
+	mov	Rcp_Timeout_Cntd, #10					;; Set timeout count
 
-	clr		IE_EA							;; update PCA reload registers
+	clr		IE_EA								;; update PCA reload registers
 		Set_Power_Pwm_Regs
 		Set_Damp_Pwm_Regs
 	setb	IE_EA
@@ -2843,29 +2860,29 @@ wait_for_comm_wait:
 ; Performs commutation switching 
 ;
 ;**** **** **** **** **** **** **** **** **** **** **** **** ****
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-Set_Pwm_A_  MACRO
-LOCAL  L0
-	Set_Pwm_A_Nodamp
-	jb		PWM_DAMPING_OFF, L0
-	Set_Pwm_A
-L0:
-ENDM
-Set_Pwm_B_  MACRO
-LOCAL  L0
-	Set_Pwm_B_Nodamp
-	jb		PWM_DAMPING_OFF, L0
-	Set_Pwm_B
-L0:
-ENDM
-Set_Pwm_C_  MACRO
-LOCAL  L0
-	Set_Pwm_C_Nodamp
-	jb		PWM_DAMPING_OFF, L0
-	Set_Pwm_C
-L0:
-ENDM
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;Set_Pwm_A_  MACRO
+;LOCAL  L0
+;	Set_Pwm_A_Nodamp
+;	jb		PWM_DAMPING_OFF, L0
+;	Set_Pwm_A
+;L0:
+;ENDM
+;Set_Pwm_B_  MACRO
+;LOCAL  L0
+;	Set_Pwm_B_Nodamp
+;	jb		PWM_DAMPING_OFF, L0
+;	Set_Pwm_B
+;L0:
+;ENDM
+;Set_Pwm_C_  MACRO
+;LOCAL  L0
+;	Set_Pwm_C_Nodamp
+;	jb		PWM_DAMPING_OFF, L0
+;	Set_Pwm_C
+;L0:
+;ENDM
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ; Comm phase 1 to comm phase 2
@@ -2876,7 +2893,7 @@ comm1comm2:
 	clr 	IE_EA				; Disable all interrupts
 		BcomFET_off 				; Turn off comfet
 		CcomFET_off 				; Turn off comfet
-		Set_Pwm_C_					; To reapply power after a demag cut
+		Set_Pwm_C					; To reapply power after a demag cut
 		AcomFET_on					; Turn on comfet
 	setb	IE_EA
 	Set_Comp_Phase_B 			; Set comparator phase
@@ -2885,7 +2902,7 @@ comm1comm2:
 	clr 	IE_EA				; Disable all interrupts
 		AcomFET_off 				; Turn off comfet
 		BcomFET_off 				; Turn off comfet
-		Set_Pwm_A_					; To reapply power after a demag cut
+		Set_Pwm_A					; To reapply power after a demag cut
 		CcomFET_on					; Turn on comfet (reverse)
 	setb	IE_EA
 	Set_Comp_Phase_B 			; Set comparator phase
@@ -2899,7 +2916,7 @@ comm2comm3:
 	clr 	IE_EA				; Disable all interrupts
 		BcomFET_off					; Turn off pwmfet
 		CcomFET_off					; Turn off pwmfet
-		Set_Pwm_B_					; To reapply power after a demag cut
+		Set_Pwm_B					; To reapply power after a demag cut
 		AcomFET_on
 	setb	IE_EA
 	Set_Comp_Phase_C 			; Set comparator phase
@@ -2908,7 +2925,7 @@ comm2comm3:
 	clr 	IE_EA				; Disable all interrupts
 		AcomFET_off					; Turn off pwmfet
 		BcomFET_off					; Turn off pwmfet
-		Set_Pwm_B_					; To reapply power after a demag cut
+		Set_Pwm_B					; To reapply power after a demag cut
 		CcomFET_on
 	setb	IE_EA
 	Set_Comp_Phase_A 			; Set comparator phase (reverse)
@@ -2922,7 +2939,7 @@ comm3comm4:
 	clr 	IE_EA				; Disable all interrupts
 		AcomFET_off 				; Turn off comfet
 		BcomFET_off 				; Turn off comfet
-		Set_Pwm_B_					; To reapply power after a demag cut
+		Set_Pwm_B					; To reapply power after a demag cut
 		CcomFET_on					; Turn on comfet
 	setb	IE_EA
 	Set_Comp_Phase_A 			; Set comparator phase
@@ -2931,7 +2948,7 @@ comm3comm4:
 	clr 	IE_EA				; Disable all interrupts
 		BcomFET_off 				; Turn off comfet (reverse)
 		CcomFET_off 				; Turn off comfet (reverse)
-		Set_Pwm_B_					; To reapply power after a demag cut
+		Set_Pwm_B					; To reapply power after a demag cut
 		AcomFET_on					; Turn on comfet (reverse)
 	setb	IE_EA
 	Set_Comp_Phase_C 			; Set comparator phase (reverse)
@@ -2945,7 +2962,7 @@ comm4comm5:
 	clr 	IE_EA				; Disable all interrupts
 		AcomFET_off
 		BcomFET_off
-		Set_Pwm_A_					; To reapply power after a demag cut
+		Set_Pwm_A					; To reapply power after a demag cut
 		CcomFET_on
 	setb	IE_EA
 	Set_Comp_Phase_B 			; Set comparator phase
@@ -2954,7 +2971,7 @@ comm4comm5:
 	clr 	IE_EA				; Disable all interrupts
 		BcomFET_off					; Turn off pwmfet
 		CcomFET_off					; Turn off pwmfet
-		Set_Pwm_C_
+		Set_Pwm_C
 		AcomFET_on					; To reapply power after a demag cut
 	setb	IE_EA
 	Set_Comp_Phase_B 			; Set comparator phase
@@ -2968,7 +2985,7 @@ comm5comm6:
 	clr 	IE_EA				; Disable all interrupts
 		AcomFET_off 				; Turn off comfet
 		CcomFET_off 				; Turn off comfet
-		Set_Pwm_A_					; To reapply power after a demag cut
+		Set_Pwm_A					; To reapply power after a demag cut
 		BcomFET_on					; Turn on comfet
 	setb	IE_EA
 	Set_Comp_Phase_C 			; Set comparator phase
@@ -2977,7 +2994,7 @@ comm5comm6:
 	clr 	IE_EA				; Disable all interrupts
 		AcomFET_off 				; Turn off comfet (reverse)
 		CcomFET_off 				; Turn off comfet (reverse)
-		Set_Pwm_C_					; To reapply power after a demag cut
+		Set_Pwm_C					; To reapply power after a demag cut
 		BcomFET_on					; Turn on comfet
 	setb	IE_EA
 	Set_Comp_Phase_A 			; Set comparator phase (reverse)
@@ -2991,7 +3008,7 @@ comm6comm1:
 	clr 	IE_EA				; Disable all interrupts
 		AcomFET_off					; Turn off pwmfet
 		CcomFET_off					; Turn off pwmfet
-		Set_Pwm_C_
+		Set_Pwm_C
 		BcomFET_on					; To reapply power after a demag cut
 	setb	IE_EA
 	Set_Comp_Phase_A 			; Set comparator phase
@@ -3000,7 +3017,7 @@ comm6comm1:
 	clr 	IE_EA				; Disable all interrupts
 		AcomFET_off					; Turn off pwmfet (reverse)
 		CcomFET_off					; Turn off pwmfet (reverse)
-		Set_Pwm_A_
+		Set_Pwm_A
 		BcomFET_on					; To reapply power after a demag cut
 	setb	IE_EA
 	Set_Comp_Phase_C 			; Set comparator phase (reverse)
@@ -3662,6 +3679,28 @@ check_rcp_level:
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Initialize_PCA_ MACRO
+	mov	PCA0CN0, #40h				; PCA enabled
+	mov	PCA0MD, #08h				; PCA clock is system clock
+ IF FETON_DELAY == 0
+	IF MCU_48MHZ == 0
+		mov	PCA0PWM, #82h				; PCA ARSEL set and 10bits pwm
+	ELSE
+		mov	PCA0PWM, #83h				; PCA ARSEL set and 11bits pwm
+	ENDIF
+	mov	PCA0CENT, #00h				; Edge aligned pwm
+ ELSE
+	IF PWM_BITS == 9
+		mov	PCA0PWM, #81h				; PCA ARSEL set and 9bits pwm
+	ELSE
+		mov	PCA0PWM, #82h				; PCA ARSEL set and 10bits pwm
+	ENDIF
+	mov	PCA0CENT, #03h				; Center aligned pwm
+ ENDIF
+ENDM
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 pgm_start:
 	; Initialize flash keys to invalid values
 	mov	Flash_Key_1, #0
@@ -3694,12 +3733,14 @@ pgm_start:
 	Initialize_Xbar
 	; Switch power off again, after initializing ports
 	call	switch_power_off
+	
 	; Clear RAM
 	clr	A				; Clear accumulator
 	mov	Temp1, A			; Clear Temp1
 	clear_ram:	
-	mov	@Temp1, A			; Clear RAM
+		mov	@Temp1, A			; Clear RAM
 	djnz Temp1, clear_ram	; Is A not zero? - jump
+	
 	; Set default programmed parameters
 	call	set_default_parameters
 	; Read all programmed parameters
@@ -3761,11 +3802,11 @@ bootloader_done:
 	; Setup timers for pwm input
 	mov	TMR2CN0, #04h		; Timer 2 enabled
 	mov	TMR3CN0, #04h		; Timer 3 enabled
-	Initialize_PCA			; Initialize PCA
+	Initialize_PCA_			; Initialize PCA
 	Set_Pwm_Polarity		; Set pwm polarity
 	Enable_Power_Pwm_Module	; Enable power pwm module
 	Enable_Damp_Pwm_Module	; Enable damping pwm module
-	clr		PWM_DAMPING_OFF	;; if set, disable damping
+	;;clr		PWM_DAMPING_OFF	;; if set, disable damping
 	; Enable interrupts
 IF MCU_48MHZ == 0
 	mov	IE, #21h			; Enable timer 2 interrupts and INT0 interrupts
