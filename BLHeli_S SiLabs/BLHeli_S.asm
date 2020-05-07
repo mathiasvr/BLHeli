@@ -73,7 +73,12 @@ $NOMOD51
 ; - Rev16.74	Remove PCA int, update new PWM value into PCA reload registers instantly
 ;				For FETON_DELAY=0, also update damp PCA channel
 ; - Rev16.75	Rearrange commutatioin logic	 
-; - Rev16.76	Add PWM 48k mode			
+; - Rev16.76	Add PWM 48k mode
+;					PWM 24khz: 10bit
+;					PWM 48khz:  9bit
+; - Rev16.77	Preset a damping off to sccure non-overlaping of PWM and comp-PWM	
+;				Aligh PWM to commutation rising edge
+;				Stop support deadtime=0
 ;**** **** **** **** **** **** **** **** **** **** **** **** **** **** **** 
 ;
 ; Minimum 8K Bytes of In-System Self-Programmable Flash
@@ -275,9 +280,11 @@ ENDIF
 IF PWM == 24
 	PWM_BITS				EQU	10		;; 24khz
 	PWM_DELTA_SIGMA_BITS	EQU	1 
+	PWM_MASK				EQU 07h
 ELSE
 	PWM_BITS				EQU	9		;; 48khz
 	PWM_DELTA_SIGMA_BITS	EQU	2 
+	PWM_MASK				EQU 03h
 ENDIF
 
 ;**** **** **** **** ****
@@ -523,7 +530,7 @@ ISEG AT 0D0h
 ;**** **** **** **** ****
 CSEG AT 1A00h            ; "Eeprom" segment
 EEPROM_FW_MAIN_REVISION		EQU	16		; Main revision of the firmware
-EEPROM_FW_SUB_REVISION		EQU	76		; Sub revision of the firmware
+EEPROM_FW_SUB_REVISION		EQU	77		; Sub revision of the firmware
 EEPROM_LAYOUT_REVISION		EQU	33		; Revision of the EEPROM layout
 
 Eep_FW_Main_Revision:		DB	EEPROM_FW_MAIN_REVISION			; EEPROM firmware main revision number
@@ -1406,6 +1413,9 @@ t1_int:
 
 t1_normal_range:	
 	IF_SET_CALL  RCP_DSHOT_LEVEL, t1_int_dshot_tlm_init	
+	
+	;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+	Set_Damp_Pwm_Regs	#0, #0					;; preset a safety damping off
 
 	; Check for bidirectional operation (0=stop, 96-2095->fwd, 2096-4095->rev)
 	jnb	Flags3.PGM_BIDIR, t1_int_not_bidir			; If not bidirectional operation - branch
@@ -1495,7 +1505,7 @@ t1_int_not_bidir:
 	mov	Temp3, A
 
 t1_int_startup_boost_stall:
-	mov	A, Stall_Cnt									; Add an extra power boost during start
+	mov	A, Stall_Cnt								; Add an extra power boost during start
 	swap	A
 	rlc	A
 	add	A, Temp3
@@ -1526,7 +1536,6 @@ t1_int_startup_boosted:
 	mov	Temp1, #1
 
 t1_int_zero_rcp_checked:
-
 	Decrement_To_0  Rcp_Outside_Range_Cnt
 
 ;;;jmp	t1_int_pulse_ready	
@@ -1534,17 +1543,17 @@ t1_int_zero_rcp_checked:
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;	
 t1_int_pulse_ready:
-	setb	Flags2.RCP_UPDATED		 		; Set updated flag
-	mov		New_Rcp, Temp1					; Store new pulse length
+	setb	Flags2.RCP_UPDATED		 				; Set updated flag
+	mov		New_Rcp, Temp1							; Store new pulse length
 	
 	IF_ZE	New_Rcp, t1_int_check_new_pulse_value 
-		mov	Rcp_Stop_Cnt, #0				; Rcp !=0 : Reset rcp stop counter
+		mov	Rcp_Stop_Cnt, #0						; Rcp !=0 : Reset rcp stop counter
 	t1_int_check_new_pulse_value:
 	
 	;; Set pwm limit
-	mov	Temp5, Pwm_Limit						; Limit to the smallest
+	mov	Temp5, Pwm_Limit							; Limit to the smallest
 	IF_LT  Pwm_Limit, Pwm_Limit_By_Rpm, t1_int_check_limit 
-		mov	Temp5, Pwm_Limit_By_Rpm				; Store limit in Temp5
+		mov	Temp5, Pwm_Limit_By_Rpm					; Store limit in Temp5
 	t1_int_check_limit:
 	
 	;; Check limit > New_Rcp, set pwm registers directly
@@ -1559,11 +1568,11 @@ t1_int_pulse_ready:
 	mov		Temp3, A
 	mov		Temp4, B
 	;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+	
+   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
    t1_int_set_pwm_registers:
-	IF PWM_BITS == 9			;; shift to 10bit throttle/pwm duty, will shift 1bit in setting pwm registers macro
-		mov		A, Temp4		;; invert then store to temp1/2
+	IF PWM_BITS == 10								;; shift to 10bit throttle/pwm duty
+		mov		A, Temp4							;; invert then store to temp1/2
 		rrc		A
 		cpl		A
 		anl		A, #03h
@@ -1573,38 +1582,43 @@ t1_int_pulse_ready:
 		cpl		A
 		mov		Temp1, A
 	ELSE	
-		mov		A, Temp4		;; invert all 11bit then store to temp1/2
+		mov		A, Temp4							;; shift to 9bit throttle/pwm duty
+		rrc		A
+		rrc		A
+		mov		PSW_F0, c
+		mov		c, ACC.7
 		cpl		A
-		anl		A, #07h
+		anl		A, #01h
 		mov		Temp2, A
 		mov		A, Temp3
+		rrc		A
+		mov		c, PSW_F0
+		rrc		A
 		cpl		A
 		mov		Temp1, A	
 	ENDIF
 
 	clr		C
 	mov		A, Temp1
-	subb	A, #(FETON_DELAY SHL 1)		;; Skew damping fet timing
+	subb	A, #(FETON_DELAY)						;; Skew damping fet timing
 	mov		Temp3, A
 	mov		A, Temp2
 	subb	A, #0	
 	mov		Temp4, A
 	
-	;;mov		PWM_DAMPING_OFF,c				;; disable damping when high throttle, cause not enough non-overlap time
+	;;mov		PWM_DAMPING_OFF,c					;; disable damping when high throttle, cause not enough non-overlap time
 	jnc		t1_int_set_pwm_damp_set
-		MOVw	Temp3, Temp4, #0, #0
+		MOVw	Temp3, Temp4, #0, #0				;; not enough non-overlap, set damping off
 	t1_int_set_pwm_damp_set:
 
+	clr		IE_EA
+		Set_Power_Pwm_Regs	Temp1, Temp2
+		Set_Damp_Pwm_Regs	Temp3, Temp4	
+	setb	IE_EA	
 	MOVw	Power_Pwm_Reg_L,Power_Pwm_Reg_H,	Temp1,Temp2
 	MOVw	Damp_Pwm_Reg_L,Damp_Pwm_Reg_H,		Temp3,Temp4
 
-	mov	Rcp_Timeout_Cntd, #10					;; Set timeout count
-
-	clr		IE_EA								;; update PCA reload registers
-		Set_Power_Pwm_Regs
-		Set_Damp_Pwm_Regs
-	setb	IE_EA
-
+	mov	Rcp_Timeout_Cntd, #10						;; Set timeout count	
 	jb		RCP_DSHOT_LEVEL, t1_int_no_dshot_tlm_exit  
 	;;; no dshot telemetry, initial to receive next dshot packet
 	mov		DPTR, #0		 		; Set pointer to start
@@ -2861,27 +2875,24 @@ wait_for_comm_wait:
 ;
 ;**** **** **** **** **** **** **** **** **** **** **** **** ****
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;Set_Pwm_A_  MACRO
-;LOCAL  L0
-;	Set_Pwm_A_Nodamp
-;	jb		PWM_DAMPING_OFF, L0
-;	Set_Pwm_A
-;L0:
-;ENDM
-;Set_Pwm_B_  MACRO
-;LOCAL  L0
-;	Set_Pwm_B_Nodamp
-;	jb		PWM_DAMPING_OFF, L0
-;	Set_Pwm_B
-;L0:
-;ENDM
-;Set_Pwm_C_  MACRO
-;LOCAL  L0
-;	Set_Pwm_C_Nodamp
-;	jb		PWM_DAMPING_OFF, L0
-;	Set_Pwm_C
-;L0:
-;ENDM
+Set_Pwm_A_  MACRO
+	mov	PCA0CN0, #00h				; PCA enabled
+		MOVw	PCA0L, PCA0H, Damp_Pwm_Reg_L,Damp_Pwm_Reg_H
+		Set_Pwm_A
+	mov	PCA0CN0, #40h				; PCA enabled
+ENDM
+Set_Pwm_B_  MACRO
+	mov	PCA0CN0, #00h				; PCA enabled
+		MOVw	PCA0L, PCA0H, Damp_Pwm_Reg_L,Damp_Pwm_Reg_H
+		Set_Pwm_B
+	mov	PCA0CN0, #40h				; PCA enabled
+ENDM
+Set_Pwm_C_  MACRO
+	mov	PCA0CN0, #00h				; PCA enabled
+		MOVw	PCA0L, PCA0H, Damp_Pwm_Reg_L,Damp_Pwm_Reg_H
+		Set_Pwm_C
+	mov	PCA0CN0, #40h				; PCA enabled
+ENDM
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -2916,7 +2927,7 @@ comm2comm3:
 	clr 	IE_EA				; Disable all interrupts
 		BcomFET_off					; Turn off pwmfet
 		CcomFET_off					; Turn off pwmfet
-		Set_Pwm_B					; To reapply power after a demag cut
+		Set_Pwm_B_					; To reapply power after a demag cut
 		AcomFET_on
 	setb	IE_EA
 	Set_Comp_Phase_C 			; Set comparator phase
@@ -2925,7 +2936,7 @@ comm2comm3:
 	clr 	IE_EA				; Disable all interrupts
 		AcomFET_off					; Turn off pwmfet
 		BcomFET_off					; Turn off pwmfet
-		Set_Pwm_B					; To reapply power after a demag cut
+		Set_Pwm_B_					; To reapply power after a demag cut
 		CcomFET_on
 	setb	IE_EA
 	Set_Comp_Phase_A 			; Set comparator phase (reverse)
@@ -2962,7 +2973,7 @@ comm4comm5:
 	clr 	IE_EA				; Disable all interrupts
 		AcomFET_off
 		BcomFET_off
-		Set_Pwm_A					; To reapply power after a demag cut
+		Set_Pwm_A_					; To reapply power after a demag cut
 		CcomFET_on
 	setb	IE_EA
 	Set_Comp_Phase_B 			; Set comparator phase
@@ -2971,7 +2982,7 @@ comm4comm5:
 	clr 	IE_EA				; Disable all interrupts
 		BcomFET_off					; Turn off pwmfet
 		CcomFET_off					; Turn off pwmfet
-		Set_Pwm_C
+		Set_Pwm_C_
 		AcomFET_on					; To reapply power after a demag cut
 	setb	IE_EA
 	Set_Comp_Phase_B 			; Set comparator phase
@@ -3008,7 +3019,7 @@ comm6comm1:
 	clr 	IE_EA				; Disable all interrupts
 		AcomFET_off					; Turn off pwmfet
 		CcomFET_off					; Turn off pwmfet
-		Set_Pwm_C
+		Set_Pwm_C_
 		BcomFET_on					; To reapply power after a demag cut
 	setb	IE_EA
 	Set_Comp_Phase_A 			; Set comparator phase
@@ -3017,7 +3028,7 @@ comm6comm1:
 	clr 	IE_EA				; Disable all interrupts
 		AcomFET_off					; Turn off pwmfet (reverse)
 		CcomFET_off					; Turn off pwmfet (reverse)
-		Set_Pwm_A
+		Set_Pwm_A_
 		BcomFET_on					; To reapply power after a demag cut
 	setb	IE_EA
 	Set_Comp_Phase_C 			; Set comparator phase (reverse)
@@ -3806,7 +3817,6 @@ bootloader_done:
 	Set_Pwm_Polarity		; Set pwm polarity
 	Enable_Power_Pwm_Module	; Enable power pwm module
 	Enable_Damp_Pwm_Module	; Enable damping pwm module
-	;;clr		PWM_DAMPING_OFF	;; if set, disable damping
 	; Enable interrupts
 IF MCU_48MHZ == 0
 	mov	IE, #21h			; Enable timer 2 interrupts and INT0 interrupts
