@@ -70,6 +70,8 @@ $NOMOD51
 ;				Fix dshot decoder INT0 wrapped issue.
 ; - Rev16.73	Lose dshot decoder timming
 ;				Arm check: more correct packet needed, bouble check zero throttol
+; - Rev16.74	Remove PCA int, update new PWM value into PCA reload registers instantly
+;				For FETON_DELAY=0, also update damp PCA channel
 ;**** **** **** **** **** **** **** **** **** **** **** **** **** **** **** 
 ;
 ; Minimum 8K Bytes of In-System Self-Programmable Flash
@@ -407,7 +409,6 @@ Power_Pwm_Reg_L:			DS	1		; Power pwm register setting (lo byte)
 Power_Pwm_Reg_H:			DS	1		; Power pwm register setting (hi byte). 0x3F is minimum power
 Damp_Pwm_Reg_L:				DS	1		; Damping pwm register setting (lo byte)
 Damp_Pwm_Reg_H:				DS	1		; Damping pwm register setting (hi byte)
-Current_Power_Pwm_Reg_H:	DS	1		; Current power pwm register setting that is loaded in the PCA register (hi byte)
 
 Pwm_Limit:					DS	1		; Maximum allowed pwm 
 Pwm_Limit_By_Rpm:			DS	1		; Maximum allowed pwm for low or high rpms
@@ -513,7 +514,7 @@ ISEG AT 0D0h
 ;**** **** **** **** ****
 CSEG AT 1A00h            ; "Eeprom" segment
 EEPROM_FW_MAIN_REVISION		EQU	16		; Main revision of the firmware
-EEPROM_FW_SUB_REVISION		EQU	73		; Sub revision of the firmware
+EEPROM_FW_SUB_REVISION		EQU	74		; Sub revision of the firmware
 EEPROM_LAYOUT_REVISION		EQU	33		; Revision of the EEPROM layout
 
 Eep_FW_Main_Revision:		DB	EEPROM_FW_MAIN_REVISION			; EEPROM firmware main revision number
@@ -610,6 +611,11 @@ ENDM
 MOVb MACRO bit1, bit2
 	mov		C, bit2
 	mov		bit1,C
+ENDM
+
+MOVw MACRO  byteL, byteH, valL, valH
+	mov		byteL, valL
+	mov		byteH, valH
 ENDM
 
 IF_SET_CALL	MACRO bit, routine
@@ -1069,8 +1075,6 @@ to_dshot_tlm_end:
 		mov		DPL, #0		 			; Set pointer to start
 		setb	IE_EX0					; Enable int0 interrupts
 		setb	IE_EX1					; Enable int1 interrupts
-		orl		EIE1, #10h				; Enable pca interrupts
-
   pop ACC
   pop PSW
 reti
@@ -1301,7 +1305,6 @@ t1_int_exit:
 	pop	B								; Restore preserved registers
 	pop	ACC
 	pop	PSW
-	orl	EIE1, #10h						; Enable pca interrupts
 reti	
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -1309,7 +1312,6 @@ reti
 t1_int:
 	clr 	IE_EA
 		clr	IE_EX0				; Disable int0 interrupts
-		anl	EIE1, #0EFh			; Disable pca interrupts
 		clr	TCON_TR1			; Stop timer 1
 		push	PSW
 		push	ACC
@@ -1554,7 +1556,7 @@ t1_int_pulse_ready:
 	ENDIF
 	
 	mov	Temp2, A
-IF FETON_DELAY != 0
+
 	clr	C
 	mov	A, Temp1							; Skew damping fet timing
 	IF MCU_48MHZ == 0
@@ -1568,45 +1570,18 @@ IF FETON_DELAY != 0
 	mov	Temp4, A
 	jnc	t1_int_set_pwm_damp_set
 
-	mov	Temp3, #0
-	mov	Temp4, #0
-
+	MOVw	Temp3, Temp4, #0, #0
 	t1_int_set_pwm_damp_set:
-ENDIF
-	mov	Power_Pwm_Reg_L, Temp1
-	mov	Power_Pwm_Reg_H, Temp2
-	
-IF FETON_DELAY != 0
-	mov	Damp_Pwm_Reg_L, Temp3
-	mov	Damp_Pwm_Reg_H, Temp4
-ENDIF
-	
+
+	MOVw	Power_Pwm_Reg_L,Power_Pwm_Reg_H,	Temp1,Temp2
+	MOVw	Damp_Pwm_Reg_L,Damp_Pwm_Reg_H,		Temp3,Temp4
+
 	mov	Rcp_Timeout_Cntd, #10				; Set timeout count
 
-IF FETON_DELAY != 0
-	Clear_COVF_Interrupt
-	Enable_COVF_Interrupt					; Generate a pca interrupt
-	jmp		t1_int_pca_init
-ELSE
-	mov	A, Current_Power_Pwm_Reg_H
-	IF MCU_48MHZ == 0
-		jnb	ACC.1, int0_int_set_pca_int_hi_pwm
-	ELSE
-		jnb	ACC.2, int0_int_set_pca_int_hi_pwm
-	ENDIF
-
-	Clear_COVF_Interrupt
-	Enable_COVF_Interrupt				; Generate a pca interrupt
-	jmp		t1_int_pca_init
-	
-	;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-	int0_int_set_pca_int_hi_pwm:
-	Clear_CCF_Interrupt
-	Enable_CCF_Interrupt				; Generate pca interrupt
-	jmp		t1_int_pca_init
-ENDIF
-
-t1_int_pca_init:
+	clr		IE_EA							;; update PCA reload registers
+		Set_Power_Pwm_Regs
+		Set_Damp_Pwm_Regs
+	setb	IE_EA
 
 	jb		RCP_DSHOT_LEVEL, t1_int_no_dshot_tlm_exit  
 	;;; no dshot telemetry, initial to receive next dshot packet
@@ -1614,9 +1589,7 @@ t1_int_pca_init:
 	setb	IE_EX0					; Enable int0 interrupts
 	setb	IE_EX1					; Enable int1 interrupts
 
-	orl		EIE1, #10h				; Enable pca interrupts
 	t1_int_no_dshot_tlm_exit:
-
 	pop	B							; Restore preserved registers
 	pop	ACC
 	pop	PSW
@@ -1696,9 +1669,6 @@ int1_int:	; Used for RC pulse timing
 		mov		DShot_Frame_Start_L, TMR2L	; Read timer value
 		mov		DShot_Frame_Start_H, TMR2H
 	setb	TMR2CN0_TR2						; Timer 2 enabled
-
-	;;; add from 16.72 to disable pca when dshot receiving
-	anl	EIE1, #0EFh			; Disable pca interrupts
 reti
 
 ;**** **** **** **** **** **** **** **** **** **** **** **** ****
@@ -1708,70 +1678,10 @@ reti
 ; No assumptions
 ;
 ;**** **** **** **** **** **** **** **** **** **** **** **** ****
-pca_int:	; Used for setting pwm registers
-  clr	IE_EA
-  push	PSW						; Preserve registers through interrupt
-  push	ACC
-  mov		PSW,#08h				; Select register bank 1 for this interrupt
-
-IF FETON_DELAY != 0					; HI/LO enable style drivers
-	mov	Temp1, PCA0L				; Read low byte, to transfer high byte to holding register
-	mov	A, Current_Power_Pwm_Reg_H
-	IF MCU_48MHZ == 0
-		jnb	ACC.1, pca_int_hi_pwm
-	ELSE
-		jnb	ACC.2, pca_int_hi_pwm
-	ENDIF
-	
-	mov	A, PCA0H
-	IF MCU_48MHZ == 0
-		jb	ACC.1, pca_int_exit			; Power below 50%, update pca in the 0x00-0x0F range
-		jb	ACC.0, pca_int_exit
-	ELSE
-		jb	ACC.2, pca_int_exit
-		jb	ACC.1, pca_int_exit
-	ENDIF
-	jmp		pca_int_set_pwm
-	
-	;;;;;;;;;;;;;;;;;;;;;;;;;
-	pca_int_hi_pwm:
-	mov	A, PCA0H
-	IF MCU_48MHZ == 0
-		jnb	ACC.1, pca_int_exit			; Power above 50%, update pca in the 0x20-0x2F range
-		jb	ACC.0, pca_int_exit
-	ELSE
-		jnb	ACC.2, pca_int_exit
-		jb	ACC.1, pca_int_exit
-	ENDIF
-	
-	;;;;;;;;;;;;;;;;;;;;;;;;;
-	pca_int_set_pwm:
-	Set_Power_Pwm_Regs
-	Set_Damp_Pwm_Regs
-	mov	Current_Power_Pwm_Reg_H, Power_Pwm_Reg_H
-	Disable_COVF_Interrupt
-ELSE								; EN/PWM style drivers
-	Set_Power_Pwm_Regs
-	mov	Current_Power_Pwm_Reg_H, Power_Pwm_Reg_H
-	Disable_COVF_Interrupt
-	Disable_CCF_Interrupt
-ENDIF
-	;;;;;;;;;;;;;;;;;;;;;;;;;
-	; Pwm updated, enable/disable interrupts
+;;; PCA int removed from 16.74
+pca_int:	
 	anl	EIE1, #0EFh					; Disable pca interrupts
-
-pca_int_exit:
-	Clear_COVF_Interrupt
-	
-IF FETON_DELAY == 0
-	Clear_CCF_Interrupt
-ENDIF
-
-  pop	ACC							; Restore preserved registers
-  pop	PSW
-  setb	IE_EA
 reti
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;**** **** **** **** **** **** **** **** **** **** **** **** ****
 ;
@@ -3706,27 +3616,20 @@ ret
 ;;; check rcp level return C:	0: low for normal dshot 
 ;;								1: high for inverted dshot
 check_rcp_level:
-	push	ACC
-
-check_rcp_level_0:	
-	mov		A,#20				;; must repeat the same level 20 times
+	mov		A,#30				;; must repeat the same level 20 times
 	jb		RTX_PORT.Rcp_In, check_rcp_level_read1
-	check_rcp_level_read0:
+  check_rcp_level_read0:
 	DELAY_A	10
-	jb		RTX_PORT.Rcp_In, check_rcp_level_0
+	jb		RTX_PORT.Rcp_In, check_rcp_level
 	djnz	ACC, check_rcp_level_read0
 	clr		C
-	
-	pop		ACC
-	ret
-	check_rcp_level_read1:
+  ret
+  check_rcp_level_read1:
 	DELAY_A	10
-	jnb		RTX_PORT.Rcp_In, check_rcp_level_0
+	jnb		RTX_PORT.Rcp_In, check_rcp_level
 	djnz	ACC, check_rcp_level_read1	
 	setb	C
-	
-	pop		ACC
-ret
+  ret
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -3788,7 +3691,6 @@ pgm_start:
 	call wait30ms
 	call led_control
 
-
 ;**** **** **** **** **** **** **** **** **** **** **** **** ****
 ;
 ; No signal entry point
@@ -3840,7 +3742,7 @@ IF MCU_48MHZ == 0
 ELSE
 	mov	IE, #23h			; Enable timer 0, timer 2 interrupts and INT0 interrupts
 ENDIF
-	mov	EIE1, #90h		; Enable timer 3 and PCA0 interrupts
+	mov	EIE1, #80h ;; test 90h		; Enable timer 3 and PCA0 interrupts
 	
 	mov	IP, #03h		;;t0 and int0 both high priority 		#01h ; High priority to INT0 interrupts
 	
