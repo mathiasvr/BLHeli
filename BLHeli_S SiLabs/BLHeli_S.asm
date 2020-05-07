@@ -67,7 +67,9 @@ $NOMOD51
 ;				Stop support BB1(24Mhz)
 ; - Rev16.72	Change timming to tlm375/750
 ;				Modify delay between dshot/tlm to 30us to meet spec.        
-;				Fix dshot decoder timer0 wrapped issue.
+;				Fix dshot decoder INT0 wrapped issue.
+; - Rev16.73	Lose dshot decoder timming
+;				Arm check: more correct packet needed, bouble check zero throttol
 ;**** **** **** **** **** **** **** **** **** **** **** **** **** **** **** 
 ;
 ; Minimum 8K Bytes of In-System Self-Programmable Flash
@@ -511,7 +513,7 @@ ISEG AT 0D0h
 ;**** **** **** **** ****
 CSEG AT 1A00h            ; "Eeprom" segment
 EEPROM_FW_MAIN_REVISION		EQU	16		; Main revision of the firmware
-EEPROM_FW_SUB_REVISION		EQU	72		; Sub revision of the firmware
+EEPROM_FW_SUB_REVISION		EQU	73		; Sub revision of the firmware
 EEPROM_LAYOUT_REVISION		EQU	33		; Revision of the EEPROM layout
 
 Eep_FW_Main_Revision:		DB	EEPROM_FW_MAIN_REVISION			; EEPROM firmware main revision number
@@ -638,6 +640,14 @@ LOCAL L0
 L0:
 ENDM
 
+IF_NZ_JUMP MACRO byte, lab
+LOCAL L0
+	mov		A, byte
+	jz		L0
+	jmp		lab
+L0:
+ENDM
+
 IF_C_SET_JUMP MACRO lab
 LOCAL L0
 	jnc		L0
@@ -721,10 +731,11 @@ LOCAL L_0
 L_0:
 ENDM
 
-Decrement_To_1 MACRO byte
+Decrement_To_0 MACRO byte
 LOCAL L0
-	djnz	byte, L0
-	inc		byte
+	mov		A, byte
+	jz		L0
+	dec		byte
 L0:
 ENDM
 
@@ -890,7 +901,7 @@ dshot_rll_encode_F_01111:
 ret
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 dshot_gcr_enccode:
 dshot_gcr_7:
 	mov		A, DShot_TempH
@@ -962,9 +973,9 @@ dshot_gcr_1:
 	
 	mov		DShot_TempH,#03h
 jmp	dshot_gcr_end		
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 dshot_make_packet:	
 ;;; 16bit to 12bit gcr encode		;;;;;;;;;;;;;;	
 	jb		DShot_TempH.7, dshot_gcr_7
@@ -1007,8 +1018,7 @@ dshot_gcr_end:
 	
 	PUSH_R0	B
 ret
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;**** **** **** **** **** **** **** **** **** **** **** **** ****
 ;
@@ -1074,7 +1084,7 @@ to_dshot_tlm_exit:
 reti
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;**** **** **** **** **** **** **** **** **** **** **** **** ****
 ;
 ; Timer 2 interrupt routine
@@ -1106,10 +1116,7 @@ IF MCU_48MHZ == 1
 ENDIF
 
 	; Update RC pulse timeout counter 
-	mov	A, Rcp_Timeout_Cntd			; RC pulse timeout count zero?
-	jz	($+4)					; Yes - do not decrement
-
-	dec	Rcp_Timeout_Cntd			; No decrement
+	Decrement_To_0  Rcp_Timeout_Cntd
 
 	; Check RC pulse against stop value
 	clr	C
@@ -1127,7 +1134,7 @@ t2_int_exit:
   pop	ACC			; Restore preserved registers
   pop	PSW
 reti
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;**** **** **** **** **** **** **** **** **** **** **** **** ****
 ;
@@ -1147,7 +1154,7 @@ t3_int:	; Used for commutation timing
 	anl	TMR3CN0, #07Fh		; Timer 3 interrupt flag cleared
 	setb	IE_EA			; Enable all interrupts
 	reti
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;**** **** **** **** **** **** **** **** **** **** **** **** ****
 ;
@@ -1156,7 +1163,7 @@ t3_int:	; Used for commutation timing
 ; No assumptions
 ;
 ;**** **** **** **** **** **** **** **** **** **** **** **** ****
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 t1_int_dshot_tlm_init:
   push	PSW
   mov	PSW, #10h			;; using bank2	
@@ -1215,7 +1222,7 @@ LOCAL L0
 		clr	C
 		subb	A, B					;; Subtract previous timestamp
 	pop		B
-	add		A, R0					;; add previous compensation value
+	add		A, R0						;; add previous compensation value
 	clr		C
 	subb	A, DShot_Pwm_Thr			; Check if bit is zero or one
 	mov		R0, #0
@@ -1233,7 +1240,7 @@ t1_int_dshot_decode:
 	mov		DShot_TempL, #0
 	mov		DShot_TempH, #0
 	mov		DShot_Csum,#0
-	mov		R0, #0						;; previous pulse width remained
+	mov		R0, #0							;; previous pulse width remained
 	mov		B, #0							;; previous timestamp
 
 	Decode_Dshot_Bit DShot_TempH.3
@@ -1255,7 +1262,7 @@ t1_int_dshot_decode:
 	Decode_Dshot_Bit DShot_Csum.1
 	Decode_Dshot_Bit DShot_Csum.0
 
-	mov		A, DShot_TempL				;; 4bit xor checksumswap	A
+	mov		A, DShot_TempL				;; 4bit xor checksum
 	swap	A
 	xrl		A, DShot_TempL
 	xrl		A, DShot_TempH
@@ -1267,40 +1274,38 @@ t1_int_dshot_decode:
 	xrl		A, DShot_Csum
 	anl		A, #0Fh
 ret
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 t1_int_outside_range:
 	mov		DPTR, #0		 	; Set pointer to start
 	setb	IE_EX0			; Enable int0 interrupts
 	setb	IE_EX1			; Enable int1 interrupts
 
-	inc	Rcp_Outside_Range_Cnt
-	mov	A, Rcp_Outside_Range_Cnt
-	jnz	($+4)
+	Increment_To_FFh  Rcp_Outside_Range_Cnt
+	Increment_To_FFh  Rcp_Outside_Range_Cnt
 
-	dec	Rcp_Outside_Range_Cnt
+	IF_LT  Rcp_Outside_Range_Cnt, #50, t1_int_set_timeout
+	;clr	C
+	;mov	A, Rcp_Outside_Range_Cnt
+	;subb	A, #50						; Allow a given number of outside pulses
+	;jnc	($+4)
+	;ajmp	t1_int_set_timeout			; If outside limits - ignore first pulses
 
-	clr	C
-	mov	A, Rcp_Outside_Range_Cnt
-	subb	A, #50						; Allow a given number of outside pulses
-	jnc	($+4)
-	ajmp	t1_int_set_timeout			; If outside limits - ignore first pulses
-
-	mov	New_Rcp, #0					; Set pulse length to zero
+	mov		New_Rcp, #0						; Set pulse length to zero
 	ajmp	t1_int_exit	
 
-t1_int_set_timeout:
+	t1_int_set_timeout:
 	mov	Rcp_Timeout_Cntd, #10			; Set timeout count
 t1_int_exit:
-	pop	B							; Restore preserved registers
+	pop	B								; Restore preserved registers
 	pop	ACC
 	pop	PSW
-	orl	EIE1, #10h					; Enable pca interrupts
+	orl	EIE1, #10h						; Enable pca interrupts
 reti	
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 t1_int:
 	clr 	IE_EA
 		clr	IE_EX0				; Disable int0 interrupts
@@ -1493,12 +1498,12 @@ t1_int_startup_boosted:
 
 t1_int_zero_rcp_checked:
 
-	Decrement_To_1  Rcp_Outside_Range_Cnt
+	Decrement_To_0  Rcp_Outside_Range_Cnt
 
 ;;;jmp	t1_int_pulse_ready	
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;	
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;	
 t1_int_pulse_ready:
 	mov	New_Rcp, Temp1						; Store new pulse length
 	setb	Flags2.RCP_UPDATED		 		; Set updated flag
@@ -1616,7 +1621,7 @@ t1_int_pca_init:
 	pop	ACC
 	pop	PSW
 reti
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;**** **** **** **** **** **** **** **** **** **** **** **** ****
 ;
@@ -1674,7 +1679,7 @@ int0_int_do_again_inverted:
 	pop	 PSW
 	clr		TCON_IE0
 reti
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;**** **** **** **** **** **** **** **** **** **** **** **** ****
 ;
@@ -1766,7 +1771,7 @@ ENDIF
   pop	PSW
   setb	IE_EA
 reti
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;**** **** **** **** **** **** **** **** **** **** **** **** ****
 ;
@@ -3655,7 +3660,7 @@ led_3_done:
 ;**** **** **** **** **** **** **** **** **** **** **** **** ****
 ;**** **** **** **** **** **** **** **** **** **** **** **** ****
 ;**** **** **** **** **** **** **** **** **** **** **** **** ****
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 pgm_start_dshot600_timming:
 	; Setup timers for DShot600/tlm750
 	mov		TCON, #51h							; Timer 0/1 run and INT0 edge triggered
@@ -3665,9 +3670,9 @@ pgm_start_dshot600_timming:
 	mov		TH1, #0
 	
 	mov		CKCON0, #0Ch											; Timer 0/1 clock is system clock (for DShot600)
-	mov		DShot_Timer_Preset, #60								; Load DShot sync timer preset (for DShot600)
+	mov		DShot_Timer_Preset, #60									; Load DShot sync timer preset (for DShot600)
 	mov		DShot_Pwm_Thr, #32										; Load DShot qualification pwm threshold (for DShot600)								; Load DShot qualification pwm threshold min (for DShot600)
-	SET_VALUE RCP_DSHOT_LEVEL, DShot_Pwm_Thr_max, #26, #23	
+	SET_VALUE RCP_DSHOT_LEVEL, DShot_Pwm_Thr_max, #30, #27			;; 72c: 26,23 failed
 	mov		DShot_Frame_Length_Thr1, #DSHOT600_FRAME_LENGTH-30		; Load DShot frame length criteria
 	mov		DShot_Frame_Length_Thr2, #DSHOT600_FRAME_LENGTH*10/DSHOT_PACKET_SIZE		; Load DShot frame length criteria
 	
@@ -3675,7 +3680,7 @@ pgm_start_dshot600_timming:
 	mov		Dshot_Tlm_Bit_Time2, #DSTLM750_BIT_TIME_2
 	mov		Dshot_Tlm_Bit_Time3, #DSTLM750_BIT_TIME_3
 ret
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 pgm_start_dshot300_timming:
 	; Setup timers for DShot300/tlm375
 	mov		TCON, #51h							; Timer 0/1 run and INT0 edge triggered
@@ -3687,7 +3692,7 @@ pgm_start_dshot300_timming:
 	mov		CKCON0, #0Ch											; Timer 0/1 clock is system clock (for DShot600)
 	mov		DShot_Timer_Preset, #0									; Load DShot sync timer preset (for DShot600)
 	mov		DShot_Pwm_Thr, #64										; Load DShot qualification pwm threshold (for DShot600)
-	SET_VALUE RCP_DSHOT_LEVEL, DShot_Pwm_Thr_max, #56, #46			; Load DShot qualification pwm threshold min (for DShot600)
+	SET_VALUE RCP_DSHOT_LEVEL, DShot_Pwm_Thr_max, #60, #54			; Load DShot qualification pwm threshold min (for DShot600)
 	mov		DShot_Frame_Length_Thr1, #DSHOT300_FRAME_LENGTH-60		; Load DShot frame length criteria
 	mov		DShot_Frame_Length_Thr2, #DSHOT300_FRAME_LENGTH*10/DSHOT_PACKET_SIZE		; Load DShot frame length criteria
 
@@ -3695,9 +3700,9 @@ pgm_start_dshot300_timming:
 	mov		Dshot_Tlm_Bit_Time2, #DSTLM375_BIT_TIME_2
 	mov		Dshot_Tlm_Bit_Time3, #DSTLM375_BIT_TIME_3
 ret
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;	
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;	
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;	
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;	
 ;;; check rcp level return C:	0: low for normal dshot 
 ;;								1: high for inverted dshot
 check_rcp_level:
@@ -3722,9 +3727,9 @@ check_rcp_level_0:
 	
 	pop		ACC
 ret
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 pgm_start:
 	; Initialize flash keys to invalid values
 	mov	Flash_Key_1, #0
@@ -3876,29 +3881,31 @@ ENDIF
 	setb	IE_EA
 
 	; Test whether signal is DShot600
-	mov		Rcp_Outside_Range_Cnt, #10			; Set out of range counter
-	call 	wait100ms							; Wait for new RC pulse
-	
-	mov 	Dshot_Cmd, #0
-	mov 	Dshot_Cmd_Cnt, #0
-	IF_LT	Rcp_Outside_Range_Cnt, #10, validate_rcp_start
-	
-	; Setup variables for DShot300
-	call	pgm_start_dshot300_timming
-		mov		Rcp_Outside_Range_Cnt, #10			; Set out of range counter
+		mov		Rcp_Outside_Range_Cnt, #50			; Set out of range counter
 		call 	wait100ms							; Wait for new RC pulse
 		mov 	Dshot_Cmd, #0
 		mov 	Dshot_Cmd_Cnt, #0
-	IF_LT	Rcp_Outside_Range_Cnt, #10, validate_rcp_start
+	IF_LT	Rcp_Outside_Range_Cnt, #2, validate_rcp_start
+	
+	; Test whether signal is DShot300
+	call	pgm_start_dshot300_timming
+		mov		Rcp_Outside_Range_Cnt, #50			; Set out of range counter
+		call 	wait100ms							; Wait for new RC pulse
+		mov 	Dshot_Cmd, #0
+		mov 	Dshot_Cmd_Cnt, #0
+	IF_LT	Rcp_Outside_Range_Cnt, #2, validate_rcp_start
 	
 	jmp		init_no_signal
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 validate_rcp_start:
 	; Validate RC pulse
 	call wait3ms						; Wait for new RC pulse
-	jb	Flags2.RCP_UPDATED, ($+6)		; Is there an updated RC pulse available - proceed
-	ljmp	init_no_signal					; Go back to detect input signal
-
+	
+	IF_CLR_JUMP  Flags2.RCP_UPDATED, init_no_signal
+		;jb	Flags2.RCP_UPDATED, ($+6)		; Is there an updated RC pulse available - proceed
+		;ljmp	init_no_signal				; Go back to detect input signal
+	IF_NZ_JUMP  New_Rcp, init_no_signal
+	
 	; Beep arm sequence start signal
 	clr 	IE_EA						; Disable all interrupts
 	call beep_f1						; Signal that RC pulse is ready
@@ -4022,12 +4029,13 @@ program_by_tx_checked:
 	mov	Flash_Key_1, #0
 	mov	Flash_Key_2, #0
 	call wait100ms				; Wait for new throttle value
-	clr	C
-	mov	A, New_Rcp			; Load new RC pulse value
-	subb	A, #1				; Below stop?
-	jc	arm_end_beep			; Yes - proceed
-
-	jmp	arming_start			; No - start over
+	
+	IF_NZ_JUMP  New_Rcp, init_no_signal
+		;clr	C
+		;mov	A, New_Rcp			; Load new RC pulse value
+		;subb	A, #1				; Below stop?
+		;jc	arm_end_beep			; Yes - proceed
+		;jmp	arming_start			; No - start over
 
 arm_end_beep:
 	; Beep arm sequence end signal
