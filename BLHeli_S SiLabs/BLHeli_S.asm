@@ -1433,15 +1433,9 @@ IF FETON_DELAY != 0
 	mov	Damp_Pwm_Reg_L, Temp3
 	mov	Damp_Pwm_Reg_H, Temp4
 ENDIF
-	mov	Rcp_Timeout_Cntd, #10			; Set timeout count
 IF FETON_DELAY != 0
-	pop	B							; Restore preserved registers
-	pop	ACC
-	pop	PSW
 	Clear_COVF_Interrupt
 	Enable_COVF_Interrupt				; Generate a pca interrupt
-	orl	EIE1, #10h					; Enable pca interrupts
-	reti
 ELSE
 	mov	A, Current_Power_Pwm_Reg_H
 IF MCU_48MHZ == 0
@@ -1450,22 +1444,14 @@ ELSE
 	jnb	ACC.2, int0_int_set_pca_int_hi_pwm
 ENDIF
 
-	pop	B							; Restore preserved registers
-	pop	ACC
-	pop	PSW
 	Clear_COVF_Interrupt
 	Enable_COVF_Interrupt				; Generate a pca interrupt
-	orl	EIE1, #10h					; Enable pca interrupts
-	reti
+
+	jmp int0_int_set_timeout
 
 int0_int_set_pca_int_hi_pwm:
-	pop	B							; Restore preserved registers
-	pop	ACC
-	pop	PSW
 	Clear_CCF_Interrupt
 	Enable_CCF_Interrupt				; Generate pca interrupt
-	orl	EIE1, #10h					; Enable pca interrupts
-	reti
 ENDIF
 
 int0_int_set_timeout:
